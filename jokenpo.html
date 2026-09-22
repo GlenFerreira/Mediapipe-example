@@ -1,0 +1,252 @@
+<!doctype html>
+<html lang="pt-BR">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Jokenpô vs IA</title>
+<style>
+  :root { color-scheme: dark; }
+  * { box-sizing: border-box; }
+  html, body { margin: 0; height: 100%; background: #0b0d14; font-family: system-ui, sans-serif; color: #fff; overflow: hidden; }
+  #stage { position: relative; width: 100vw; height: 100vh; }
+  video, canvas { position: absolute; inset: 0; width: 100%; height: 100%; object-fit: cover; transform: scaleX(-1); }
+  video { opacity: .55; }
+  #hud { position: absolute; top: 0; left: 0; right: 0; display: flex; justify-content: space-between; padding: 16px 24px; font-size: clamp(18px, 3vw, 28px); font-weight: 800; text-shadow: 0 2px 8px #000a; pointer-events: none; }
+  #status { position: absolute; bottom: 16px; left: 0; right: 0; text-align: center; font-weight: 600; text-shadow: 0 2px 6px #000; pointer-events: none; }
+  #overlay { position: absolute; inset: 0; display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 14px; background: #0b0d14cc; text-align: center; padding: 24px; }
+  #overlay h1 { margin: 0; font-size: clamp(28px, 5vw, 52px); }
+  #overlay p { margin: 0; max-width: 460px; opacity: .85; }
+  button { font: inherit; font-weight: 700; font-size: 20px; padding: 14px 36px; border: 0; border-radius: 999px; background: #ffd23f; color: #222; cursor: pointer; }
+  button:disabled { opacity: .6; cursor: wait; }
+  .result-row { display: flex; gap: 36px; align-items: center; justify-content: center; margin: 6px 0; }
+  .result-col { display: flex; flex-direction: column; align-items: center; gap: 6px; }
+  .result-emoji { font-size: 64px; }
+  .result-label { font-size: 14px; opacity: .75; text-transform: uppercase; letter-spacing: .06em; }
+  .verdict { font-size: clamp(24px, 4vw, 36px); font-weight: 800; }
+  .verdict.win { color: #7CFC8C; }
+  .verdict.lose { color: #ff6b6b; }
+  .verdict.draw { color: #ffd23f; }
+  [hidden] { display: none !important; }
+</style>
+</head>
+<body>
+<div id="stage">
+  <video id="video" playsinline muted></video>
+  <canvas id="canvas"></canvas>
+  <div id="hud"><span>Você: <span id="scoreYou">0</span></span><span>Jokenpô 🪨📄✂️</span><span>IA: <span id="scoreAi">0</span></span></div>
+  <div id="status"></div>
+  <div id="overlay">
+    <h1 id="title">Jokenpô vs IA ✋</h1>
+    <p id="msg">Aperte começar, prepare a mão em frente à câmera e faça Pedra, Papel ou Tesoura quando aparecer "JÁ!".</p>
+    <button id="btn">Começar</button>
+  </div>
+</div>
+
+<script src="https://cdn.jsdelivr.net/npm/@mediapipe/hands@0.4.1675469240/hands.js" crossorigin="anonymous"></script>
+<script>
+const MOVES = ['pedra', 'papel', 'tesoura'];
+const EMOJI = { pedra: '🪨', papel: '📄', tesoura: '✂️', null: '❓' };
+const LABEL = { pedra: 'Pedra', papel: 'Papel', tesoura: 'Tesoura', null: '?' };
+// pedra > tesoura > papel > pedra
+const BEATS = { pedra: 'tesoura', tesoura: 'papel', papel: 'pedra' };
+
+const video = document.getElementById('video');
+const canvas = document.getElementById('canvas');
+const ctx = canvas.getContext('2d');
+const overlay = document.getElementById('overlay');
+const btn = document.getElementById('btn');
+const statusEl = document.getElementById('status');
+const scoreYouEl = document.getElementById('scoreYou');
+const scoreAiEl = document.getElementById('scoreAi');
+
+let ready = false, mpHands = null, detecting = false;
+let handsScreen = [];         // pontos em pixels, para desenhar
+let gestureBuffer = [];       // {t, gesture} coletado a cada frame detectado
+let score = { you: 0, ai: 0 };
+
+// state: 'idle' | 'countdown' | 'result'
+let state = 'idle';
+let phaseStart = 0;
+const STEP = 800;              // duração de cada número (3,2,1)
+const CAPTURE = 1000;          // janela de captura após "JÁ!" (tempo para fazer o gesto)
+const COUNTDOWN_TOTAL = STEP * 3;
+
+function resize() { canvas.width = innerWidth; canvas.height = innerHeight; }
+addEventListener('resize', resize); resize();
+
+function toScreen(lm) {
+  const vw = video.videoWidth || 640, vh = video.videoHeight || 480;
+  const s = Math.max(canvas.width / vw, canvas.height / vh);
+  const ox = (canvas.width - vw * s) / 2, oy = (canvas.height - vh * s) / 2;
+  return { x: lm.x * vw * s + ox, y: lm.y * vh * s + oy };
+}
+
+function dist(a, b) { return Math.hypot(a.x - b.x, a.y - b.y); }
+
+// Classifica o gesto a partir dos 21 landmarks normalizados (não convertidos para tela).
+function classifyGesture(lm) {
+  const wrist = lm[0];
+  const fingers = [
+    { tip: 8, pip: 6 },   // indicador
+    { tip: 12, pip: 10 }, // médio
+    { tip: 16, pip: 14 }, // anelar
+    { tip: 20, pip: 18 }, // mindinho
+  ];
+  const ext = fingers.map(f => dist(wrist, lm[f.tip]) > dist(wrist, lm[f.pip]) * 1.08);
+  const n = ext.filter(Boolean).length;
+  const [iExt, mExt, rExt, pExt] = ext;
+
+  if (n >= 3) return 'papel';
+  if (iExt && mExt && !rExt && !pExt) return 'tesoura';
+  if (n <= 1) return 'pedra';
+  return null;
+}
+
+function setupHands() {
+  if (typeof Hands === 'undefined') { statusEl.textContent = '⚠ Biblioteca MediaPipe não carregou (verifique a internet)'; return; }
+  mpHands = new Hands({ locateFile: f => `https://cdn.jsdelivr.net/npm/@mediapipe/hands@0.4.1675469240/${f}` });
+  mpHands.setOptions({ maxNumHands: 1, modelComplexity: 0, minDetectionConfidence: 0.6, minTrackingConfidence: 0.5 });
+  mpHands.onResults(res => {
+    const lmList = res.multiHandLandmarks || [];
+    handsScreen = lmList.map(l => l.map(toScreen));
+    const gesture = lmList.length ? classifyGesture(lmList[0]) : null;
+    gestureBuffer.push({ t: performance.now(), gesture });
+    if (gestureBuffer.length > 90) gestureBuffer.shift();
+    statusEl.textContent = lmList.length ? '' : 'Mostre sua mão para a câmera';
+  });
+  statusEl.textContent = 'Carregando detecção de mão…';
+}
+
+async function detectLoop() {
+  if (mpHands && !detecting && video.readyState >= 2) {
+    detecting = true;
+    try { await mpHands.send({ image: video }); }
+    catch (e) { statusEl.textContent = '⚠ Erro na detecção: ' + e.message; }
+    detecting = false;
+  }
+  requestAnimationFrame(detectLoop);
+}
+
+async function init() {
+  btn.disabled = true; btn.textContent = 'Abrindo câmera…';
+  try {
+    const stream = await navigator.mediaDevices.getUserMedia({ video: { width: 640, height: 480, frameRate: 30, facingMode: 'user' }, audio: false });
+    video.srcObject = stream;
+    await video.play();
+  } catch (e) {
+    document.getElementById('msg').textContent = 'Não consegui acessar a câmera. Permita o acesso e abra via http://localhost ou https.';
+    btn.disabled = false; btn.textContent = 'Tentar de novo';
+    return;
+  }
+  setupHands();
+  detectLoop();
+  ready = true;
+  startRound();
+}
+
+function startRound() {
+  overlay.hidden = true;
+  gestureBuffer = [];
+  state = 'countdown';
+  phaseStart = performance.now();
+}
+
+function majorityGesture(fromT, toT) {
+  const votes = {};
+  for (const e of gestureBuffer) {
+    if (e.t >= fromT && e.t <= toT && e.gesture) votes[e.gesture] = (votes[e.gesture] || 0) + 1;
+  }
+  let best = null, bestN = 0;
+  for (const g in votes) if (votes[g] > bestN) { best = g; bestN = votes[g]; }
+  return best;
+}
+
+function finishRound() {
+  // usa só a parte final da janela de captura, para dar tempo da mão se ajustar antes de votar
+  const captureEnd = performance.now();
+  const playerMove = majorityGesture(captureEnd - CAPTURE * 0.4, captureEnd);
+  const aiMove = MOVES[Math.floor(Math.random() * 3)];
+
+  let verdict, verdictClass;
+  if (!playerMove) {
+    verdict = 'Não identifiquei sua jogada — tente de novo!';
+    verdictClass = 'draw';
+  } else if (playerMove === aiMove) {
+    verdict = 'Empate!';
+    verdictClass = 'draw';
+  } else if (BEATS[playerMove] === aiMove) {
+    verdict = 'Você venceu! 🎉';
+    verdictClass = 'win';
+    score.you++;
+  } else {
+    verdict = 'A IA venceu!';
+    verdictClass = 'lose';
+    score.ai++;
+  }
+  scoreYouEl.textContent = score.you;
+  scoreAiEl.textContent = score.ai;
+
+  document.getElementById('title').innerHTML = `
+    <div class="result-row">
+      <div class="result-col"><div class="result-emoji">${EMOJI[playerMove]}</div><div class="result-label">Você: ${LABEL[playerMove]}</div></div>
+      <div class="result-col"><div class="result-emoji">${EMOJI[aiMove]}</div><div class="result-label">IA: ${LABEL[aiMove]}</div></div>
+    </div>`;
+  document.getElementById('msg').innerHTML = `<span class="verdict ${verdictClass}">${verdict}</span>`;
+  btn.disabled = false; btn.textContent = 'Jogar de novo';
+  overlay.hidden = false;
+  state = 'result';
+}
+
+btn.onclick = () => ready ? startRound() : init();
+
+function drawHandDots() {
+  const TIPS = [4, 8, 12, 16, 20, 9];
+  for (const h of handsScreen) {
+    ctx.fillStyle = '#ffffff';
+    for (const t of TIPS) { ctx.beginPath(); ctx.arc(h[t].x, h[t].y, 8, 0, 7); ctx.fill(); }
+    ctx.strokeStyle = '#ffd23f'; ctx.lineWidth = 3;
+    ctx.beginPath(); ctx.arc(h[9].x, h[9].y, 24, 0, 7); ctx.stroke();
+  }
+}
+
+function drawCenterText(text, size, color, alpha) {
+  ctx.save();
+  ctx.globalAlpha = alpha;
+  ctx.font = `800 ${size}px system-ui, sans-serif`;
+  ctx.fillStyle = color;
+  ctx.textAlign = 'center';
+  ctx.textBaseline = 'middle';
+  ctx.shadowColor = '#000a';
+  ctx.shadowBlur = 20;
+  // desenha sem espelhar o texto (o canvas já está espelhado via CSS)
+  ctx.translate(canvas.width / 2, canvas.height / 2);
+  ctx.scale(-1, 1);
+  ctx.fillText(text, 0, 0);
+  ctx.restore();
+}
+
+function loop() {
+  const now = performance.now();
+  ctx.clearRect(0, 0, canvas.width, canvas.height);
+  drawHandDots();
+
+  if (state === 'countdown') {
+    const elapsed = now - phaseStart;
+    if (elapsed < COUNTDOWN_TOTAL) {
+      const n = 3 - Math.floor(elapsed / STEP);
+      const local = (elapsed % STEP) / STEP;
+      const scale = 1 + 0.4 * (1 - local);
+      drawCenterText(String(n), 160 * scale, '#ffd23f', 1);
+    } else if (elapsed < COUNTDOWN_TOTAL + CAPTURE) {
+      drawCenterText('JÁ!', 140, '#7CFC8C', 1);
+    } else {
+      finishRound();
+    }
+  }
+
+  requestAnimationFrame(loop);
+}
+requestAnimationFrame(loop);
+</script>
+</body>
+</html>
